@@ -594,6 +594,13 @@ class TestLiveCore:
                             "CommandLine": "UnrealInsights.exe",
                             "CreationDate": "now",
                         },
+                        {
+                            "Name": "CustomUnrealHost.exe",
+                            "ProcessId": 300,
+                            "ExecutablePath": "C:/Tools/CustomUnrealHost.exe",
+                            "CommandLine": "CustomUnrealHost.exe",
+                            "CreationDate": "now",
+                        },
                     ]
                 ),
             },
@@ -601,8 +608,12 @@ class TestLiveCore:
 
         with patch("cli_anything.unrealinsights.core.live.os.name", "nt"):
             result = list_unreal_processes()
-        assert result["process_count"] == 2
-        assert {process["role"] for process in result["processes"]} == {"editor", "insights"}
+        assert result["process_count"] == 3
+        assert {process["role"] for process in result["processes"]} == {"editor", "insights", "unknown"}
+
+        with patch("cli_anything.unrealinsights.core.live.os.name", "nt"):
+            no_tools = list_unreal_processes(include_tools=False)
+        assert {process["role"] for process in no_tools["processes"]} == {"editor", "unknown"}
 
     def test_live_exec_requires_backend(self, monkeypatch):
         from cli_anything.unrealinsights.core.live import execute_live_command

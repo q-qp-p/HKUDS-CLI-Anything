@@ -105,7 +105,7 @@ def _list_posix_unreal_processes() -> list[dict[str, object]]:
 def list_unreal_processes(*, include_tools: bool = True) -> dict[str, object]:
     """List local Unreal-related processes."""
     processes = _list_windows_unreal_processes() if os.name == "nt" else _list_posix_unreal_processes()
-    processes = [process for process in processes if process["role"] not in ("helper", "unknown")]
+    processes = [process for process in processes if process["role"] != "helper"]
     if not include_tools:
         processes = [process for process in processes if process["role"] not in ("insights", "trace-server")]
     processes.sort(key=lambda process: (str(process.get("role")), int(process.get("pid") or 0)))
