@@ -748,7 +748,7 @@
     {
       "name": "ueatelier",
       "display_name": "UEAtelier",
-      "version": "0.23.0",
+      "version": "0.23.1",
       "description": "Unreal Editor 5.6/5.7 MCP self-extension workbench - editor automation, build diagnostics, Task Atlas workflows, PIE smoke verification, scaffold pipeline",
       "requires": "Unreal Engine 5.6 or 5.7 with the UEAtelier plugin extracted into <YourProject>/",
       "homepage": "https://github.com/edwinmeng163-oss/UEAtelier",
