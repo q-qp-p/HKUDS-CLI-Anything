@@ -58,21 +58,28 @@ DOMShell 2.0.0+ exposes a single MCP tool:
 |------|-------------|
 | `domshell_execute` | Runs a shell-style command string. Multi-line input is supported — each line runs in order in the same shell state. |
 
-The harness builds command strings from the public CLI commands:
+The harness builds command strings from the public CLI commands. Harness
+absolute paths (leading `/`) are anchored at the tab root via
+`cd %here%` since DOMShell's lane cwd may have drifted; relative paths
+are passed through unchanged.
 
-| CLI Command | Command string sent to `domshell_execute` |
-|-------------|--------------------------------------------|
-| `fs ls <path>` | `ls <path>` |
-| `fs cd <path>` | `cd <path>` |
-| `fs cat <path>` | `cat <path>` |
-| `fs grep <pat>` | `grep <pat>` |
-| `fs grep <pat> <path>` | `cd <path>\ngrep <pat>\ncd <prev>` (single call) |
-| `act click <path>` | `click <path>` |
-| `act type <path> <text>` | `focus <path>\ntype <text>` (single call) |
+| CLI Command (path is absolute) | Command string sent to `domshell_execute` |
+|--------------------------------|--------------------------------------------|
+| `fs ls /<sub>` | `cd %here%/<sub>` then bare `ls`, then `cd <restore>` (single multi-line call) |
+| `fs cd /<sub>` | `cd %here%/<sub>` (single line — `cd` is the desired new state) |
+| `fs cat /<sub>` | `cd %here%`, `cat <sub>`, `cd <restore>` (single multi-line call) |
+| `fs grep <pat>` | `grep <pat>` (operates on lane cwd) |
+| `fs grep <pat> /<sub>` | `cd %here%/<sub>`, `grep <pat>`, `cd <restore>` (single multi-line call) |
+| `act click /<sub>` | `cd %here%`, `click <sub>`, `cd <restore>` (single multi-line call) |
+| `act type /<sub> <text>` | `cd %here%`, `focus <sub>`, `cd <restore>` — then, on success, `type <text>` (two calls, shared lane via `group_id`) |
 | `page open <url>` | `open <url>` |
 | `page reload` | `refresh` |
 | `page back` | `back` |
 | `page forward` | `forward` |
+
+`<restore>` resolves to `cd %here%/<harness-working-dir>` (or `cd %here%`
+when the harness is at the tab root) so the lane's cwd ends up where
+the harness expects.
 
 ## Key Design Decisions
 

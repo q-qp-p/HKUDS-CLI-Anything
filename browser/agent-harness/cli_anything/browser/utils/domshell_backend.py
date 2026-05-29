@@ -186,27 +186,102 @@ def _capture_lane(session: Any, result: Any) -> None:
         session.domshell_lane_id = lane
 
 
-def _translate_path(harness_path: str) -> str:
-    """Translate a harness DOM path to a DOMShell command path.
+def _translate_path(harness_path: str) -> tuple[str, bool]:
+    """Translate a harness DOM path into ``(stripped, is_absolute)``.
 
     The harness models ``/`` as the focused tab's AX root. DOMShell models
-    ``~/`` (and bare ``/``) as the BROWSER root — windows and tabs.
-    Sending ``ls /`` verbatim would list tabs, not page elements. Strip
-    the leading ``/`` so harness ``/main`` becomes DOMShell ``main``
-    (relative to the lane's cwd, which IS the focused tab's AX root once
-    ``page open`` has put the lane inside the tab).
+    ``/`` and ``~/`` as the BROWSER root (windows/tabs). DOMShell also
+    keeps a per-lane cwd that persists between commands — so after
+    ``fs cd /main`` the lane cwd is no longer the tab root, and a
+    subsequent ``ls main`` (the naive strip-one-slash form) would resolve
+    against the drifted cwd as ``/main/main``. Wrong target.
 
-    - ``""`` and ``"/"`` → ``""`` (signal: operate on lane cwd; the
-      wrappers turn this into a bare command, e.g. ``ls`` or ``cd %here%``).
-    - ``"/main"`` → ``"main"``
-    - ``"/main/article"`` → ``"main/article"``
-    - ``"main"``, ``".."``, ``"."`` → passed through unchanged.
+    The fix: distinguish *absolute* from *relative* harness paths so
+    callers can wrap the operation in ``cd %here%[/deeper]\\n<op>\\ncd
+    <restore>`` for the absolute case (anchoring at the tab root), and
+    pass relative paths through unchanged (the lane cwd is the right
+    reference for them).
+
+    Uses ``lstrip("/")`` so accidental ``//main`` collapses to ``main``.
+
+    Examples:
+        ``""``          → ``("", False)``
+        ``"/"``         → ``("", True)``
+        ``"/main"``     → ``("main", True)``
+        ``"//main"``    → ``("main", True)``
+        ``"/main/btn"`` → ``("main/btn", True)``
+        ``"main"``      → ``("main", False)``
+        ``".."``        → ``("..", False)``
     """
-    if not harness_path or harness_path == "/":
-        return ""
+    # Newline guard at the translation boundary: absolute-path branches
+    # interpolate `%here%/<translated>` without going through `_q`
+    # (DOMShell's path-variable expander runs before quote parsing on
+    # `cd`, so quoting would defeat it). Catching newlines here means
+    # every wrapper that consumes the translated path is protected
+    # against injection, even if the wrapper skips `_q`.
+    if "\n" in harness_path or "\r" in harness_path:
+        raise ValueError(
+            "Newline characters are not allowed in path arguments — "
+            "DOMShell's domshell_execute treats them as command separators, "
+            f"so a newline in a path would inject additional commands. "
+            f"Got ({len(harness_path)} chars): "
+            f"{(harness_path[:80] + ('…' if len(harness_path) > 80 else ''))!r}"
+        )
+    if not harness_path:
+        return "", False
     if harness_path.startswith("/"):
-        return harness_path[1:]
-    return harness_path
+        return harness_path.lstrip("/"), True
+    return harness_path, False
+
+
+def _here_path(deeper: str) -> str:
+    """Build a ``%here%[/<deeper>]`` token, shell-quoted as a single unit.
+
+    DOMShell's ``cd`` accepts quoted ``%here%`` cleanly
+    (``cd '%here%/main'`` was upstream-smoked: ``✓ Entered tab …``), so
+    we quote uniformly via ``_q``. Whitespace, brackets, ``$`` etc. in
+    the ``<deeper>`` portion survive the wrap correctly.
+
+    For simple cases (no shell metacharacters) ``_q`` returns the input
+    unchanged, so ``_here_path("main")`` is still ``%here%/main``.
+    """
+    return _q(f"%here%/{deeper}") if deeper else _q("%here%")
+
+
+def _restore_cwd_cmd(session: Any) -> str:
+    """Build the trailing ``cd <wd>`` line for an absolute-path wrap.
+
+    Uses the harness's tracked ``working_dir`` (translated to DOMShell
+    form) so after the wrapped operation the lane's cwd matches what the
+    harness thinks it is. Without this restore, a wrapped operation
+    against ``/`` would leave the lane parked at ``%here%`` even though
+    the harness's ``working_dir`` is something like ``/main``.
+
+    The harness ``working_dir`` is always absolute in normal use, so the
+    common output shape is ``cd %here%/<stripped>``. The relative
+    branch is a defensive fallback for an unusual session shape.
+    """
+    wd = getattr(session, "working_dir", None) or "/"
+    stripped, is_abs = _translate_path(wd)
+    if is_abs:
+        return f"cd {_here_path(stripped)}"
+    return f"cd {_q(stripped)}" if stripped else f"cd {_here_path('')}"
+
+
+def _wrap_absolute(operation: str, session: Any, *, deeper: str = "") -> str:
+    """Build a ``cd %here%[/deeper]\\n<operation>\\n<restore>`` triplet.
+
+    ``deeper`` is the optional tab-root-relative subdir to ``cd`` into
+    BEFORE the operation. Used for ``ls /main`` where the operation is
+    bare ``ls`` (and the ``/main`` needs to become the anchored cwd) as
+    opposed to ``cat /main/btn`` where the operation already carries the
+    relative path and we just anchor at the tab root.
+
+    The ``%here%/<deeper>`` token is shell-quoted as a single unit via
+    ``_here_path``, so paths containing whitespace or other shell
+    metacharacters survive the wrap correctly.
+    """
+    return f"cd {_here_path(deeper)}\n{operation}\n{_restore_cwd_cmd(session)}"
 
 
 def _is_error(result: Any) -> bool:
@@ -407,8 +482,15 @@ def ls(path: str = "/", use_daemon: bool = False, *, session: Any = None) -> dic
         >>> ls("/")
         {"path": "/", "entries": [{"name": "main", "role": "landmark", ...}]}
     """
-    translated = _translate_path(path)
-    command = f"ls {_q(translated)}" if translated else "ls"
+    translated, is_absolute = _translate_path(path)
+    if is_absolute:
+        # `ls /main`: cd to %here%/main, run bare ls, restore.
+        # `ls /`:     cd to %here%,      run bare ls, restore.
+        command = _wrap_absolute("ls", session, deeper=translated)
+    elif translated:
+        command = f"ls {_q(translated)}"
+    else:
+        command = "ls"
     return asyncio.run(_call_execute(command, use_daemon, session=session))
 
 
@@ -427,11 +509,17 @@ def cd(path: str, use_daemon: bool = False, *, session: Any = None) -> dict:
         >>> cd("/main/div[0]")
         {"path": "/main/div[0]", "element": {...}}
     """
-    translated = _translate_path(path)
-    # Harness `cd /` means "back to focused-tab AX root" — DOMShell's
-    # equivalent is `cd %here%`, which jumps to the tab root regardless
-    # of where the lane wandered to.
-    command = "cd %here%" if not translated else f"cd {_q(translated)}"
+    translated, is_absolute = _translate_path(path)
+    # cd is the rare case where the operation IS the new state — no
+    # restore needed. Absolute targets anchor via `cd %here%/<rest>` so
+    # the result is independent of the lane's current cwd.
+    if is_absolute:
+        command = f"cd {_here_path(translated)}"
+    elif translated:
+        command = f"cd {_q(translated)}"
+    else:
+        # Bare/empty `cd` → back to tab root.
+        command = f"cd {_here_path('')}"
     return asyncio.run(_call_execute(command, use_daemon, session=session))
 
 
@@ -450,13 +538,19 @@ def cat(path: str, use_daemon: bool = False, *, session: Any = None) -> dict:
         >>> cat("/main/button[0]")
         {"name": "Submit", "role": "button", "text": "Submit", ...}
     """
-    translated = _translate_path(path)
+    translated, is_absolute = _translate_path(path)
     if not translated:
         raise ValueError(
             "cat: an element name is required — cannot cat the tab root. "
             "Use `ls` to list the root's children, or pass a specific name."
         )
-    return asyncio.run(_call_execute(f"cat {_q(translated)}", use_daemon, session=session))
+    if is_absolute:
+        # `cat /main/btn`: anchor at tab root, run `cat main/btn` relative,
+        # restore the harness's tracked cwd.
+        command = _wrap_absolute(f"cat {_q(translated)}", session)
+    else:
+        command = f"cat {_q(translated)}"
+    return asyncio.run(_call_execute(command, use_daemon, session=session))
 
 
 def grep(
@@ -502,22 +596,39 @@ def grep(
         {"matches": ["/main/button[0]"]}
     """
     _assert_single_line("pattern", pattern)
-    translated_path = _translate_path(path)
-    translated_prev = _translate_path(prev)
-    if translated_path:
-        _assert_single_line("path", path)
-        _assert_single_line("prev", prev)
-        # Harness `/` (the default for `prev`) means "back to focused-tab
-        # AX root", which is DOMShell's `cd %here%`. Any other restore
-        # path becomes `cd <translated>`.
-        restore = (
-            f"cd {_q(translated_prev)}" if translated_prev else "cd %here%"
+    translated_path, path_abs = _translate_path(path)
+    if not translated_path:
+        # Unrooted grep — operate on lane cwd, no cd, no restore.
+        return asyncio.run(
+            _call_execute(f"grep {_q(pattern)}", use_daemon, session=session)
         )
-        command = f"cd {_q(translated_path)}\ngrep {_q(pattern)}\n{restore}"
-        return asyncio.run(_call_execute(command, use_daemon, session=session))
-    return asyncio.run(
-        _call_execute(f"grep {_q(pattern)}", use_daemon, session=session)
-    )
+
+    _assert_single_line("path", path)
+    _assert_single_line("prev", prev)
+
+    if path_abs:
+        # Absolute path: anchor at `%here%/<target>`, grep, restore to the
+        # harness's tracked working_dir (so the lane cwd doesn't drift).
+        # The `%here%/<target>` token is quoted as a single unit by
+        # `_here_path` — survives whitespace / shell metachars cleanly.
+        cd_line = f"cd {_here_path(translated_path)}"
+        restore = _restore_cwd_cmd(session)
+    else:
+        # Relative path: lane cwd is the right reference. `prev` defaults
+        # to "/" — for relative grep we just go back to whatever caller
+        # asked, shell-quoted (or `%here%/...` for absolute prev).
+        translated_prev, prev_abs = _translate_path(prev)
+        cd_line = f"cd {_q(translated_path)}"
+        if prev_abs:
+            restore = f"cd {_here_path(translated_prev)}"
+        else:
+            restore = (
+                f"cd {_q(translated_prev)}"
+                if translated_prev
+                else f"cd {_here_path('')}"
+            )
+    command = f"{cd_line}\ngrep {_q(pattern)}\n{restore}"
+    return asyncio.run(_call_execute(command, use_daemon, session=session))
 
 
 def click(path: str, use_daemon: bool = False, *, session: Any = None) -> dict:
@@ -535,14 +646,16 @@ def click(path: str, use_daemon: bool = False, *, session: Any = None) -> dict:
         >>> click("/main/button[0]")
         {"action": "click", "path": "/main/button[0]", "status": "success"}
     """
-    translated = _translate_path(path)
+    translated, is_absolute = _translate_path(path)
     if not translated:
         raise ValueError(
             "click: an element name is required — cannot click the tab root."
         )
-    return asyncio.run(
-        _call_execute(f"click {_q(translated)}", use_daemon, session=session)
-    )
+    if is_absolute:
+        command = _wrap_absolute(f"click {_q(translated)}", session)
+    else:
+        command = f"click {_q(translated)}"
+    return asyncio.run(_call_execute(command, use_daemon, session=session))
 
 
 def open_url(url: str, use_daemon: bool = False, *, session: Any = None) -> dict:
@@ -644,18 +757,37 @@ def type_text(
     """
     _assert_single_line("path", path)
     _assert_single_line("text", text)
-    translated_path = _translate_path(path)
+
+    # A session is required: the focus and type halves split across two
+    # _call_execute calls, and without `session.domshell_lane_id` the
+    # second call would land in a different DOMShell lane and miss the
+    # focus state from the first.
+    if session is None:
+        raise ValueError(
+            "type_text: a session argument is required so the focus and type "
+            "calls share a DOMShell lane. Otherwise the focus state from the "
+            "first call would not apply to the second."
+        )
+
+    translated_path, is_absolute = _translate_path(path)
     if not translated_path:
         raise ValueError(
-            "type_text: an element name is required — cannot focus the tab root."
+            "type_text: an input path is required — cannot focus the tab root."
         )
+
     # Relies on DOMShell serializing commands within a lane: the `type`
     # call below cannot be preempted by another agent's `focus` on the
     # same lane between these two _call_execute boundaries. If that
     # contract ever changes upstream, this needs to revert to a single
     # multi-line call with an alternative safety story.
+    if is_absolute:
+        # Anchor + focus + restore as one multi-line call, so the focus
+        # lands against the tab root regardless of lane cwd drift.
+        focus_cmd = _wrap_absolute(f"focus {_q(translated_path)}", session)
+    else:
+        focus_cmd = f"focus {_q(translated_path)}"
     focus_result = asyncio.run(_call_execute(
-        f"focus {_q(translated_path)}", use_daemon, session=session,
+        focus_cmd, use_daemon, session=session,
     ))
     if _is_error(focus_result):
         return focus_result  # don't type — focus didn't land
