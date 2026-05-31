@@ -143,6 +143,46 @@ class TestExtractCliMetadata:
         assert "export" in cmd_names
         assert "import-data" in cmd_names
 
+    def test_respects_explicit_click_names(self, tmp_path):
+        software = "named"
+        cli_pkg = tmp_path / "cli_anything" / software
+        cli_pkg.mkdir(parents=True)
+        (cli_pkg / "__init__.py").write_text("")
+        (cli_pkg / f"{software}_cli.py").write_text(
+            textwrap.dedent("""\
+            import click
+
+            @click.group()
+            def cli():
+                pass
+
+            @cli.group("remote-access")
+            def remote_access_group():
+                \"\"\"Remote access commands.\"\"\"
+                pass
+
+            @remote_access_group.command("list-active")
+            def list_active_sessions():
+                \"\"\"List active sessions.\"\"\"
+                pass
+
+            @cli.command(name="health-check")
+            def health():
+                \"\"\"Check service health.\"\"\"
+                pass
+            """)
+        )
+
+        metadata = extract_cli_metadata(str(tmp_path))
+        groups = {group.name: group for group in metadata.command_groups}
+
+        assert "Remote Access" in groups
+        assert "Remote Access Group" not in groups
+        assert [cmd.name for cmd in groups["Remote Access"].commands] == ["list-active"]
+        cli_commands = [cmd.name for cmd in groups["Cli"].commands]
+        assert "health-check" in cli_commands
+        assert "health" not in cli_commands
+
     def test_generates_examples(self, harness_dir):
         metadata = extract_cli_metadata(str(harness_dir))
         assert len(metadata.examples) > 0
